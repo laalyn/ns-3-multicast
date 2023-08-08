@@ -4,7 +4,7 @@ BasedOnStyle: Microsoft
 
 AllowAllArgumentsOnNextLine: false
 AllowAllParametersOfDeclarationOnNextLine: false
-AlwaysBreakAfterReturnType: TopLevelDefinitions
+AlwaysBreakAfterReturnType: None
 AlwaysBreakTemplateDeclarations: Yes
 BinPackArguments: false
 BinPackParameters: false
@@ -23,7 +23,10 @@ IncludeCategories:
     SortPriority: 0
 KeepEmptyLinesAtTheStartOfBlocks: false
 PackConstructorInitializers: Never
-PointerAlignment: Left
-QualifierAlignment: Left
+PointerAlignment: Right
+QualifierAlignment: Right
 SeparateDefinitionBlocks: Always
 Standard: "c++17"
+IndentWidth: 2
+BreakBeforeBraces: Attach
+AlignAfterOpenBracket: AlwaysBreak
