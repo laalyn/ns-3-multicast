@@ -30,6 +30,9 @@
 
 #include <list>
 
+#define RIP_ALL_NODE "224.0.0.9"
+#define RIP_PORT 520
+
 namespace ns3 {
 
 /**
@@ -163,6 +166,21 @@ private:
  * \returns the reference to the output stream
  */
 std::ostream &operator<<(std::ostream &os, RipRoutingTableEntry const &route);
+
+struct RouterRef {
+  uint32_t addr; // assuming 0 is not possible
+  double lastPong;
+};
+
+struct GroupState {
+  RouterRef upstream;
+  // I don't think we can use RouterRef for downstream...
+  // actually the std::set trick with overloaded < still works
+  std::map<uint32_t, double> downstream;
+  bool flushing;
+  uint32_t flushUpstream;
+  std::set<uint32_t> flushDownstream;
+};
 
 /**
  * \ingroup rip
@@ -424,6 +442,54 @@ private:
 
   bool m_initialized;  //!< flag to allow socket's late-creation.
   uint32_t m_linkDown; //!< Link down value.
+
+  /* CBT */
+  /* scale by group, fixed single core */
+
+  // group address to core address assignment function (right now hardcoded)
+  uint32_t GroupToCore(uint32_t grpAddr);
+
+  void SendPing(uint32_t grpAddr, uint32_t pingAddr);
+  void HandlePing(uint32_t grpAddr, uint32_t pongAddr);
+  void SendPong(uint32_t grpAddr, uint32_t pongAddr);
+  void HandlePong(uint32_t grpAddr, uint32_t pingAddr);
+  void SendAllPingOnInterval(double itv);
+
+  void CheckAlive(uint32_t grpAddr, uint32_t routerAddr);
+  void CheckAllAliveOnInterval(double itv);
+
+  void SendJoinGroup(uint32_t grpAddr, uint32_t upstreamAddr, bool pinned);
+  void SetUpstream(uint32_t grpAddr);
+  void JoinGroup(uint32_t grpAddr, uint32_t memberAddr, bool pinned);
+
+  void SendFlush(uint32_t grpAddr, uint32_t downstreamAddr);
+  void FlushTimeout(uint32_t grpAddr);
+  // set flushing state and propagate down
+  void HandleFlush(uint32_t grpAddr);
+  void SendFlushed(uint32_t grpAddr, uint32_t upstreamAddr);
+  // clear flushing state and propagate up
+  void HandleFlushed(uint32_t grpAddr);
+
+  // group -> group state
+  std::map<uint32_t, GroupState> m_groups;
+
+  // addrs that will never be autoremoved or pinged (for device addrs)
+  std::set<uint32_t> m_pinnedAddrs;
+
+  // how long we wait between pings (poll-style)
+  double m_pingDelay;
+
+  // how old the last received pong can be for an alive router
+  double m_aliveWait;
+
+  // how long before we fully recheck alives for all groups (poll-style)
+  double m_recheckAlive;
+
+  // maximum amount of time in flush state
+  double m_flushHold;
+
+  /* Helper */
+  void SendRip(uint32_t addr, uint8_t *buf, uint32_t size);
 };
 
 } // namespace ns3

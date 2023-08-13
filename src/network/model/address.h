@@ -231,6 +231,8 @@ class Address
      */
     void Deserialize(TagBuffer buffer);
 
+    uint8_t m_data[MAX_SIZE]; //!< The address value
+
   private:
     /**
      * \brief Equal to operator.
@@ -279,7 +281,7 @@ class Address
 
     uint8_t m_type;           //!< Type of the address
     uint8_t m_len;            //!< Length of the address
-    uint8_t m_data[MAX_SIZE]; //!< The address value
+    // uint8_t m_data[MAX_SIZE]; //!< The address value
 };
 
 ATTRIBUTE_HELPER_HEADER(Address);

@@ -36,9 +36,6 @@
 
 #include <iomanip>
 
-#define RIP_ALL_NODE "224.0.0.9"
-#define RIP_PORT 520
-
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE("Rip");
@@ -124,6 +121,271 @@ int64_t Rip::AssignStreams(int64_t stream) {
   return 1;
 }
 
+uint32_t Rip::GroupToCore(uint32_t grpAddr) {
+  if (grpAddr == Ipv4Address("239.192.0.1").Get()) {
+    return Ipv4Address("10.0.1.2").Get();
+  } else {
+    NS_LOG_ERROR("No core found for group");
+    return 0;
+  }
+}
+
+void Rip::SendRip(uint32_t addr, uint8_t *buf, uint32_t size) {
+  Ptr<Socket> sock = Socket::CreateSocket(this->GetObject<Node>(), TypeId::LookupByName("ns3::UdpSocketFactory"));
+
+  Ptr<Packet> p = Create<Packet>(buf, size);
+  SocketIpTtlTag tag;
+  tag.SetTtl(1);
+  p->AddPacketTag(tag);
+
+  sock->SendTo(p, 0, InetSocketAddress(Ipv4Address(addr), RIP_PORT));
+}
+
+void Rip::SendPing(uint32_t grpAddr, uint32_t pingAddr) {
+  if (m_pinnedAddrs.find(pingAddr) == m_pinnedAddrs.end()) {
+    uint8_t buf[] = {4, 0, 0, 0, 0};
+    Ipv4Address(grpAddr).Serialize(buf + 1);
+    SendRip(pingAddr, buf, 5);
+  }
+}
+
+void Rip::HandlePing(uint32_t grpAddr, uint32_t pongAddr) {
+  Rip::SendPong(grpAddr, pongAddr);
+}
+
+void Rip::SendPong(uint32_t grpAddr, uint32_t pongAddr) {
+  uint8_t buf[] = {5, 0, 0, 0, 0};
+  Ipv4Address(grpAddr).Serialize(buf + 1);
+  SendRip(pongAddr, buf, 5);
+}
+
+void Rip::HandlePong(uint32_t grpAddr, uint32_t pingAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    GroupState &grp = m_groups[grpAddr];
+    if (grp.upstream.addr == pingAddr) {
+      grp.upstream.lastPong = Simulator::Now().GetSeconds();
+    } else {
+      for (auto &[rAddr, lastPong]: grp.downstream) {
+        if (rAddr == pingAddr) {
+          grp.downstream[rAddr] = Simulator::Now().GetSeconds();
+          break;
+        }
+      }
+    }
+  }
+}
+
+void Rip::SendAllPingOnInterval(double itv) {
+  for (auto &[grpAddr, grp]: m_groups) {
+    if (grp.upstream.addr) {
+      SendPing(grpAddr, grp.upstream.addr);
+    }
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      SendPing(grpAddr, rAddr);
+    }
+  }
+
+  Simulator::Schedule(Seconds(itv), &Rip::SendAllPingOnInterval, this, itv);
+}
+
+void Rip::CheckAlive(uint32_t grpAddr, uint32_t routerAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    GroupState &grp = m_groups[grpAddr];
+    // If router is flushing, there should be no downstream nodes
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      // We lost an unpinned child
+      if (rAddr == routerAddr && m_pinnedAddrs.find(rAddr) == m_pinnedAddrs.end()) {
+        double aliveWait = Simulator::Now().GetSeconds() - lastPong;
+        if (aliveWait > m_aliveWait) {
+          grp.downstream.erase(rAddr);
+          if (grp.downstream.empty()) {
+            m_groups.erase(grpAddr);
+            // forgetting below caused use-after-free !!!
+            return;
+          }
+        }
+        break;
+      }
+    }
+    if (grp.upstream.addr == routerAddr) {
+      double aliveWait = Simulator::Now().GetSeconds() - grp.upstream.lastPong;
+      if (aliveWait > m_aliveWait) {
+        // We lost our parent, so delete it and optimistically reassign
+        // Actually if you do nothing it's the same thing on child rejoin
+        grp.upstream.addr = 0;
+        SetUpstream(grpAddr);
+      }
+    }
+  }
+}
+
+void Rip::CheckAllAliveOnInterval(double itv) {
+  // TODO could be more efficient
+  for (auto &[grpAddr, grp]: m_groups) {
+    if (grp.upstream.addr) {
+      CheckAlive(grpAddr, grp.upstream.addr);
+    }
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      CheckAlive(grpAddr, rAddr);
+    }
+  }
+
+  Simulator::Schedule(Seconds(itv), &Rip::CheckAllAliveOnInterval, this, itv);
+}
+
+void Rip::SendJoinGroup(uint32_t grpAddr, uint32_t upstreamAddr, bool pinned) {
+  uint8_t buf[] = {3, 0, 0, 0, 0, pinned};
+  Ipv4Address(grpAddr).Serialize(buf + 1);
+  SendRip(upstreamAddr, buf, 6);
+}
+
+void Rip::SetUpstream(uint32_t grpAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    GroupState &grp = m_groups[grpAddr];
+    uint32_t coreAddr = GroupToCore(grpAddr);
+    if (!grp.upstream.addr) {
+      Ptr<Ipv4Route> rte = Lookup(Ipv4Address(coreAddr), true);
+      if (rte != nullptr) {
+        if (rte->GetGateway().Get() == 0) {
+          grp.upstream.addr = coreAddr;
+        } else {
+          grp.upstream.addr = rte->GetGateway().Get();
+        }
+        Simulator::Schedule(Seconds(m_aliveWait), &Rip::CheckAlive, this, grpAddr, grp.upstream.addr);
+        SendJoinGroup(grpAddr, grp.upstream.addr, false);
+      }
+    }
+  }
+}
+
+void Rip::JoinGroup(uint32_t grpAddr, uint32_t memberAddr, bool pinned) {
+  if (pinned) {
+    m_pinnedAddrs.emplace(memberAddr);
+  }
+
+  // JoinGroup is disabled when flushing
+  // (note that some methods are still relying on downstream list being empty)
+  if (m_groups.find(grpAddr) != m_groups.end() && m_groups[grpAddr].flushing) {
+    NS_LOG_INFO("join group did nothing because router is flushing");
+    return;
+  }
+
+  // Am I the core of the group?
+  uint32_t coreAddr = GroupToCore(grpAddr);
+  bool isCore = false;
+  for (uint32_t i = 0; i < m_ipv4->GetNInterfaces(); i++) {
+    if (m_ipv4->IsDestinationAddress(Ipv4Address(coreAddr), i)) {
+      isCore = true;
+      break;
+    }
+  }
+
+  double now = Simulator::Now().GetSeconds();
+
+  // Create group if new
+  if (m_groups.find(grpAddr) == m_groups.end()) {
+    m_groups[grpAddr] = GroupState {
+        RouterRef{0, now},
+        std::map<uint32_t, double>(),
+        false,
+        0,
+        std::set<uint32_t>()
+    };
+  }
+
+  // Add Downstream
+  m_groups[grpAddr].downstream[memberAddr] = now;
+  Simulator::Schedule(Seconds(m_aliveWait), &Rip::CheckAlive, this, grpAddr, memberAddr);
+
+  if (!isCore) {
+    SetUpstream(grpAddr);
+  }
+}
+
+void Rip::SendFlush(uint32_t grpAddr, uint32_t downstreamAddr) {
+  uint8_t buf[] = {6, 0, 0, 0, 0};
+  Ipv4Address(grpAddr).Serialize(buf + 1);
+  SendRip(downstreamAddr, buf, 5);
+}
+
+void Rip::FlushTimeout(uint32_t grpAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    NS_LOG_INFO("flush timed out");
+    GroupState &grp = m_groups[grpAddr];
+    grp.upstream.addr = 0;
+    grp.upstream.lastPong = Simulator::Now().GetSeconds();
+    grp.downstream.clear();
+    grp.flushing = false;
+    if (grp.flushUpstream) {
+      SendFlushed(grpAddr, grp.flushUpstream);
+    }
+    grp.flushUpstream = 0;
+    grp.flushDownstream.clear();
+  }
+}
+
+void Rip::HandleFlush(uint32_t grpAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    GroupState &grp = m_groups[grpAddr];
+    if (grp.flushing) {
+      grp.upstream.addr = 0;
+      grp.upstream.lastPong = Simulator::Now().GetSeconds();
+      grp.downstream.clear();
+      grp.flushing = false;
+      if (grp.flushUpstream) {
+        SendFlushed(grpAddr, grp.flushUpstream);
+      }
+      grp.flushUpstream = 0;
+      grp.flushDownstream.clear();
+      return;
+    }
+
+    grp.flushing = true;
+    grp.flushUpstream = grp.upstream.addr;
+    grp.flushDownstream.clear();
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      if (m_pinnedAddrs.find(rAddr) == m_pinnedAddrs.end()) {
+        grp.flushDownstream.emplace(rAddr);
+      }
+    }
+    // not the only way to do it; in fact, I don't even know if this does anything
+    if (grp.flushDownstream.find(grp.flushUpstream) != grp.flushDownstream.end()) {
+      grp.flushUpstream = 0;
+    }
+    grp.upstream.addr = 0;
+    grp.upstream.lastPong = Simulator::Now().GetSeconds();
+    grp.downstream.clear();
+
+    for (auto downAddr: grp.flushDownstream) {
+      SendFlush(grpAddr, downAddr);
+    }
+
+    Simulator::Schedule(Seconds(m_flushHold), &Rip::FlushTimeout, this, grpAddr);
+  }
+}
+
+void Rip::SendFlushed(uint32_t grpAddr, uint32_t upstreamAddr) {
+  uint8_t buf[] = {7, 0, 0, 0, 0};
+  Ipv4Address(grpAddr).Serialize(buf + 1);
+  SendRip(upstreamAddr, buf, 5);
+}
+
+void Rip::HandleFlushed(uint32_t grpAddr) {
+  if (m_groups.find(grpAddr) != m_groups.end()) {
+    GroupState &grp = m_groups[grpAddr];
+    if (!grp.flushing) {
+      return;
+    }
+
+    grp.flushDownstream.erase(grpAddr);
+
+    if (grp.flushUpstream && grp.flushDownstream.empty()) {
+      grp.flushing = false;
+      SendFlushed(grpAddr, grp.flushUpstream);
+    }
+  }
+}
+
 void Rip::DoInitialize() {
   NS_LOG_FUNCTION(this);
 
@@ -192,6 +454,16 @@ void Rip::DoInitialize() {
   delay = Seconds(m_rng->GetValue(0.01, m_startupDelay.GetSeconds()));
   m_nextTriggeredUpdate = Simulator::Schedule(delay, &Rip::SendRouteRequest, this);
 
+  m_pingDelay = 10.0;
+  m_aliveWait = 29.0;
+  m_recheckAlive = 30.0;
+  m_flushHold = 10.0;
+
+  // TODO this might cause packet flood
+  Simulator::Schedule(Seconds(1.0), &Rip::SendAllPingOnInterval, this, m_pingDelay);
+  // TODO this is just polling but there are other methods
+  Simulator::Schedule(Seconds(1.0), &Rip::CheckAllAliveOnInterval, this, m_recheckAlive);
+
   Ipv4RoutingProtocol::DoInitialize();
 }
 
@@ -255,13 +527,56 @@ bool Rip::RouteInput(
       // ~~alan: if it's multi/broadcast then we don't want to packet to stop propagating when it
       // reaches our local node~~ alan: actually not really it just means local delivery has already
       // been done so lcb is now set to null
-      return false;
+      // return false;
     }
   }
 
   if (dst.IsMulticast()) {
-    NS_LOG_LOGIC("Multicast route not supported by RIP");
-    return false; // Let other routing protocols try to handle this
+    if (dst == Ipv4Address(RIP_ALL_NODE)) {
+      return false;
+    }
+
+    if (m_groups.find(dst.Get()) == m_groups.end()) {
+      NS_LOG_ERROR("Group not found");
+      return false;
+    }
+    GroupState &grp = m_groups[dst.Get()];
+
+    // TODO do the ttl right
+    if (header.GetTtl() < 64 - 15 || grp.downstream.find(grp.upstream.addr) != grp.downstream.end()) {
+      NS_LOG_INFO("Routing loop detected, flushing...");
+      HandleFlush(dst.Get());
+      return false;
+    }
+
+    Ipv4MulticastRoute rte;
+    rte.SetGroup(dst);
+    rte.SetOrigin("0.0.0.0"); // TODO ???
+    rte.SetParent(iif);
+    if (grp.upstream.addr) {
+      Ptr<Ipv4Route> r = Lookup(Ipv4Address(grp.upstream.addr), true);
+      if (r != nullptr) {
+        uint32_t oif = m_ipv4->GetInterfaceForAddress(r->GetSource());
+        if (oif != iif) {
+          rte.SetOutputTtl(oif, 15);
+        }
+      }
+    }
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      Ptr<Ipv4Route> r = Lookup(Ipv4Address(rAddr), true);
+      if (r != nullptr) {
+        uint32_t oif = m_ipv4->GetInterfaceForAddress(r->GetSource());
+        if (oif != iif) {
+          rte.SetOutputTtl(oif, 15);
+        }
+      }
+    }
+    // not going to reconnect if parent is down; the periodic join requests from device should work
+
+    // TODO if parent is one of children consider the cycle detected
+    // TODO check ttl of header
+
+    mcb(Ptr(&rte), p, header);
   }
 
   if (header.GetDestination().IsBroadcast()) {
@@ -512,6 +827,16 @@ void Rip::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Unit unit) co
       }
     }
   }
+
+  for (auto &[grpAddr, grp]: m_groups) {
+    *os << Ipv4Address(grpAddr) << std::endl;
+    *os << "  upstream: " << Ipv4Address(grp.upstream.addr) << "+" << (int) grp.upstream.lastPong << std::endl;
+    *os << "  downstream:" << std::endl;
+    for (auto &[rAddr, lastPong]: grp.downstream) {
+      *os << "    " << Ipv4Address(rAddr) << "+" << (int) lastPong << std::endl;
+    }
+  }
+
   *os << std::endl;
   // Restore the previous ostream state
   (*os).copyfmt(oldState);
@@ -690,6 +1015,9 @@ void Rip::Receive(Ptr<Socket> socket) {
     NS_LOG_LOGIC("Received a packet from one of the unicast sockets");
   }
 
+  uint8_t buf[32];
+  packet->CopyData(buf, 32);
+
   Ipv4PacketInfoTag interfaceInfo;
   if (!packet->RemovePacketTag(interfaceInfo)) {
     NS_ABORT_MSG("No incoming interface on RIP message, aborting.");
@@ -723,7 +1051,19 @@ void Rip::Receive(Ptr<Socket> socket) {
         "The message is a Request from " << senderAddr.GetIpv4() << ":" << senderAddr.GetPort());
     HandleRequests(hdr, senderAddress, senderPort, ipInterfaceIndex, hopLimit);
   } else {
-    NS_LOG_LOGIC("Ignoring message with unknown command: " << int(hdr.GetCommand()));
+    if (buf[0] == 3) {
+      JoinGroup(Ipv4Address::Deserialize(buf + 1).Get(), senderAddress.Get(), buf[5]);
+    } else if (buf[0] == 4) {
+      HandlePing(Ipv4Address::Deserialize(buf + 1).Get(), senderAddress.Get());
+    } else if (buf[0] == 5) {
+      HandlePong(Ipv4Address::Deserialize(buf + 1).Get(), senderAddress.Get());
+    } else if (buf[0] == 6) {
+      HandleFlush(Ipv4Address::Deserialize(buf + 1).Get());
+    } else if (buf[0] == 7) {
+      HandleFlushed(Ipv4Address::Deserialize(buf + 1).Get());
+    } else {
+      NS_LOG_LOGIC("Ignoring message with unknown command: " << int(hdr.GetCommand()));
+    }
   }
 }
 

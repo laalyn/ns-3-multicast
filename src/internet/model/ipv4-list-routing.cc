@@ -177,6 +177,7 @@ Ipv4ListRouting::RouteInput(Ptr<const Packet> p,
     // Next, try to find a route
     // If we have already delivered a packet locally (e.g. multicast)
     // we suppress further downstream local delivery by nulling the callback
+    // alan: above explanation is why in the other place (rip.cc:274) nothing runs!
     LocalDeliverCallback downstreamLcb = lcb;
     if (retVal)
     {
