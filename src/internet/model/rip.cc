@@ -454,9 +454,9 @@ void Rip::DoInitialize() {
   delay = Seconds(m_rng->GetValue(0.01, m_startupDelay.GetSeconds()));
   m_nextTriggeredUpdate = Simulator::Schedule(delay, &Rip::SendRouteRequest, this);
 
-  m_pingDelay = 10.0;
-  m_aliveWait = 29.0;
-  m_recheckAlive = 30.0;
+  m_pingDelay = 2.0;
+  m_aliveWait = 5.0;
+  m_recheckAlive = 10.0;
   m_flushHold = 10.0;
 
   // TODO this might cause packet flood
